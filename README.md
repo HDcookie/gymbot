@@ -17,6 +17,14 @@ The day number is `(today - START_DATE) + 1`. The bot posts nothing before Day 1
 ## Slash commands
 - `/today` shows today's readings.
 - `/day 42` shows the readings for any day.
+- `/test` sends today's readings (or `/test day:42`) to the daily channel right away, so you can
+  check the bot can post there. Only server admins and the user in `OWNER_ID` can run it, and the
+  reply tells you exactly why it failed if it can't post.
 
 Set `GUILD_ID` in `.env` to your server's ID (right-click the server → Copy Server ID) so the
 commands appear right away. Without it they're registered globally, which can take up to an hour.
+
+## Logs
+The bot logs to the terminal. At startup it reports which servers it's in, today's day number,
+whether it has View Channel and Send Messages in the post channel, and when the next post is.
+Every daily post logs success or the exact reason it failed.
