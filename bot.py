@@ -39,6 +39,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 SUMMARY_TIME = os.getenv("SUMMARY_TIME", "20:00")  # 24h HH:MM in TIMEZONE
 SUMMARY_IGNORE_CHANNELS = {int(c) for c in os.getenv("SUMMARY_IGNORE_CHANNELS", "").split(",") if c.strip()}
 SUMMARY_MAX_PER_CHANNEL = int(os.getenv("SUMMARY_MAX_PER_CHANNEL", "300"))
+# Conversations shorter than this are left out unless something in them needs you.
+SUMMARY_MIN_MESSAGES = int(os.getenv("SUMMARY_MIN_MESSAGES", "4"))
 
 
 def parse_time(value: str) -> dt.time:
@@ -218,14 +220,14 @@ async def send_summary(hours: int = 24) -> str | None:
         return f"Couldn't look up owner {OWNER_ID}: {e.text}"
 
     if not msgs:
-        chunks = [f"📋 **Server summary for {today():%a %b} {today().day}**\nQuiet day, nothing new."]
+        chunks = [f"## 📋 Daily Summary\n-# {today():%a, %b} {today().day}\n\nQuiet day, no messages."]
     else:
         try:
-            result = await summary.summarize(openai_client, OPENAI_MODEL, msgs, owner.display_name, TIMEZONE)
+            result = await summary.summarize(openai_client, OPENAI_MODEL, msgs)
         except Exception as e:  # network, auth, quota, bad model name...
             log.exception("OpenAI request failed")
             return f"OpenAI request failed: {e}"
-        chunks = summary.format_digest(result, msgs, today())
+        chunks = summary.format_digest(result, msgs, today(), SUMMARY_MIN_MESSAGES)
 
     try:
         for chunk in chunks:

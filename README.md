@@ -29,14 +29,17 @@ commands appear right away. Without it they're registered globally, which can ta
 ## Daily summary DM
 At `SUMMARY_TIME` (default 20:00 in `TIMEZONE`) the bot reads the last 24 hours of every channel
 and thread it can see, sends them to OpenAI, and DMs `OWNER_ID`:
-- every conversation that happened, by channel, with channel and message links
-- **Waiting on you**: questions to you, mentions, replies to your messages, unanswered questions
-- **Could use your take**: discussions already answered where your opinion would still add something
+- **Needs your reply**: questions to you, mentions, replies to your messages, unanswered questions
+- **Your take would help**: discussions already answered where your opinion would still add something
+- **What happened**: the main conversations by channel, with channel and message links
+
+Summaries describe topics only, with no names or times. Conversations shorter than
+`SUMMARY_MIN_MESSAGES` (default 4) are left out unless something in them needs you.
 
 `/summary` (owner only) sends it right away; `/summary hours:48` looks further back.
 
 Settings: `OPENAI_API_KEY` (unset = feature off), `OPENAI_MODEL` (default `gpt-5-mini`),
-`SUMMARY_TIME`, `SUMMARY_IGNORE_CHANNELS` (comma-separated channel IDs), `SUMMARY_MAX_PER_CHANNEL`
+`SUMMARY_TIME`, `SUMMARY_MIN_MESSAGES`, `SUMMARY_IGNORE_CHANNELS` (comma-separated channel IDs), `SUMMARY_MAX_PER_CHANNEL`
 (default 300, newest kept). Messages from bots are left out. Your DMs must allow messages from
 server members.
 
