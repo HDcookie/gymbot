@@ -22,11 +22,29 @@ class Msg:
     channel_id: int
     channel_name: str
     author: str
-    is_owner: bool
+    author_id: int
     time: dt.datetime
     content: str
     reply_to: int | None
-    flags: list[str] = field(default_factory=list)
+    reply_to_author_id: int | None = None
+    mention_ids: set[int] = field(default_factory=set)
+    pings_everyone: bool = False
+    pings_role: bool = False
+
+    def flags_for(self, reader_id: int) -> list[str]:
+        """Why this message might matter to a particular reader."""
+        if self.author_id == reader_id:
+            return []
+        flags = []
+        if reader_id in self.mention_ids:
+            flags.append("MENTIONS YOU")
+        if self.reply_to_author_id == reader_id:
+            flags.append("REPLY TO YOU")
+        if self.pings_everyone:
+            flags.append("@everyone/@here")
+        if self.pings_role:
+            flags.append("ROLE PING")
+        return flags
 
     @property
     def link(self) -> str:
@@ -37,7 +55,7 @@ def channel_link(guild_id: int, channel_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{channel_id}"
 
 
-async def collect(guilds, since: dt.datetime, owner_id: int, ignore: set[int], max_per_channel: int) -> list[Msg]:
+async def collect(guilds, since: dt.datetime, ignore: set[int], max_per_channel: int) -> list[Msg]:
     """Read every channel and thread the bot can see, back to `since`."""
     msgs: list[Msg] = []
     for guild in guilds:
@@ -64,13 +82,13 @@ async def collect(guilds, since: dt.datetime, owner_id: int, ignore: set[int], m
             for m in reversed(history):
                 if m.author.bot:
                     continue
-                msgs.append(to_msg(m, guild.id, owner_id))
+                msgs.append(to_msg(m, guild.id))
     msgs.sort(key=lambda m: m.time)
     log.info("Collected %d messages from %d server(s) since %s", len(msgs), len(guilds), since)
     return msgs
 
 
-def to_msg(m: discord.Message, guild_id: int, owner_id: int) -> Msg:
+def to_msg(m: discord.Message, guild_id: int) -> Msg:
     content = m.content
     if m.attachments:
         content += " " + " ".join(f"[attachment: {a.filename}]" for a in m.attachments)
@@ -80,39 +98,31 @@ def to_msg(m: discord.Message, guild_id: int, owner_id: int) -> Msg:
     if len(content) > MAX_CONTENT_CHARS:
         content = content[:MAX_CONTENT_CHARS] + "…"
 
-    flags = []
-    is_owner = m.author.id == owner_id
-    if not is_owner:
-        if any(u.id == owner_id for u in m.mentions):
-            flags.append("MENTIONS YOU")
-        ref = m.reference.resolved if m.reference else None
-        if isinstance(ref, discord.Message) and ref.author.id == owner_id:
-            flags.append("REPLY TO YOU")
-        if m.mention_everyone:
-            flags.append("@everyone/@here")
-        if m.role_mentions:
-            flags.append("ROLE PING")
-
+    ref = m.reference.resolved if m.reference else None
     return Msg(
         id=m.id,
         guild_id=guild_id,
         channel_id=m.channel.id,
         channel_name=getattr(m.channel, "name", str(m.channel.id)),
         author=m.author.display_name,
-        is_owner=is_owner,
+        author_id=m.author.id,
         time=m.created_at,
         content=content,
         reply_to=m.reference.message_id if m.reference else None,
-        flags=flags,
+        reply_to_author_id=ref.author.id if isinstance(ref, discord.Message) else None,
+        mention_ids={u.id for u in m.mentions},
+        pings_everyone=m.mention_everyone,
+        pings_role=bool(m.role_mentions),
     )
 
 
 SYSTEM_PROMPT = """\
-You write a daily digest of a Discord server for its owner. Messages from the owner are marked (YOU).
+You write a daily digest of a Discord server for one reader. Messages written by the reader are marked
+(YOU), and messages that mention or reply to them are flagged.
 
 Write about what happened, not a roll call of who was there:
 - Use a name when one person is the point: they asked something, shared news, made a decision, or
-  are waiting on the owner. In a conversation with several people, don't list who took part; just
+  are waiting on the reader. In a conversation with several people, don't list who took part; just
   say what was discussed and decided.
 - Mention a time only when it matters (a deadline, an event time, something late at night).
 - Plain, short, factual. No filler like "The conversation was about" or "Members discussed".
@@ -120,18 +130,18 @@ Write about what happened, not a roll call of who was there:
 conversations: the discussions worth knowing about.
 - Small chats usually aren't worth including: small talk, greetings, jokes, one-off reactions, quick
   exchanges of a few messages. Use judgment; a short exchange that matters (news, a decision,
-  something the owner would want to know) still belongs.
+  something the reader would want to know) still belongs.
 - One entry per topic. For each: channel_id; title (2-6 words); summary (one sentence, two at most,
   covering what was discussed and any outcome or decision); start_message_id (its first message).
 
-respond: messages the owner should look at.
-- priority "reply": anything waiting on the owner: questions or requests to them, mentions, replies to
+respond: messages the reader should look at.
+- priority "reply": anything waiting on the reader: questions or requests to them, mentions, replies to
   their messages, and questions to the group nobody answered.
 - priority "opinion": questions or discussions that were already answered or settled, where the
-  owner's view would still add something.
+  reader's view would still add something.
 - For each: message_id; title (2-6 words); reason (one short sentence saying what they asked or need;
   the author's name is shown next to it, so don't start with it).
-- Skip messages written by the owner and anything the owner already replied to.
+- Skip messages written by the reader and anything the reader already replied to.
 
 Length: aim for the finished DM to be 2000 characters or less. Each item you return also gets about
 100 characters of links and formatting added, so keep your text tight. On a busy day, prefer fewer,
@@ -177,21 +187,22 @@ SCHEMA = {
 }
 
 
-def build_transcript(msgs: list[Msg], tz: ZoneInfo) -> str:
+def build_transcript(msgs: list[Msg], tz: ZoneInfo, reader_id: int) -> str:
     lines, current = [], None
     for m in msgs:
         if m.channel_id != current:
             current = m.channel_id
             lines.append(f"\n## #{m.channel_name} (channel_id {m.channel_id})")
-        who = f"{m.author} (YOU)" if m.is_owner else m.author
+        who = f"{m.author} (YOU)" if m.author_id == reader_id else m.author
         reply = f" (reply to {m.reply_to})" if m.reply_to else ""
-        flags = f" [{', '.join(m.flags)}]" if m.flags else ""
+        flags = m.flags_for(reader_id)
+        flags = f" [{', '.join(flags)}]" if flags else ""
         lines.append(f"[{m.id}] {m.time.astimezone(tz):%a %H:%M} {who}{reply}{flags}: {m.content}")
     return "\n".join(lines).strip()
 
 
-async def summarize(client: AsyncOpenAI, model: str, msgs: list[Msg], tz: ZoneInfo) -> dict:
-    transcript = build_transcript(msgs, tz)
+async def summarize(client: AsyncOpenAI, model: str, msgs: list[Msg], tz: ZoneInfo, reader_id: int) -> dict:
+    transcript = build_transcript(msgs, tz, reader_id)
     log.info("Sending %d messages (%d chars) to %s", len(msgs), len(transcript), model)
     resp = await client.chat.completions.create(
         model=model,
@@ -206,7 +217,7 @@ async def summarize(client: AsyncOpenAI, model: str, msgs: list[Msg], tz: ZoneIn
     return json.loads(resp.choices[0].message.content)
 
 
-def format_digest(result: dict, msgs: list[Msg], date: dt.date) -> list[str]:
+def format_digest(result: dict, msgs: list[Msg], date: dt.date, reader_id: int) -> list[str]:
     """Turn the model's JSON into DM text, building every link from real ids."""
     by_id = {str(m.id): m for m in msgs}
     channels = {str(m.channel_id): m for m in msgs}  # any message, for guild id + channel name
@@ -216,7 +227,7 @@ def format_digest(result: dict, msgs: list[Msg], date: dt.date) -> list[str]:
         m = by_id.get(r["message_id"])
         if m is None:
             log.warning("Dropping respond item with unknown message id %s", r["message_id"])
-        elif not m.is_owner:
+        elif m.author_id != reader_id:
             respond.append((r, m))
 
     convos_by_channel: dict[str, list[dict]] = {}

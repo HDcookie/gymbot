@@ -21,24 +21,37 @@ load_dotenv()
 discord.utils.setup_logging(level=logging.INFO)
 log = logging.getLogger("biblebot")
 
+# Secrets come from .env; everything else from config.json.
 TOKEN = os.environ["DISCORD_TOKEN"]
-CHANNEL_ID = int(os.environ["CHANNEL_ID"])
-START_DATE = dt.date.fromisoformat(os.environ["START_DATE"])  # the date of Day 1
-TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "UTC"))
-POST_TIME = os.getenv("POST_TIME", "06:00")  # 24h HH:MM in TIMEZONE
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+CONFIG_FILE = Path(os.getenv("CONFIG_FILE", Path(__file__).with_name("config.json")))
+with CONFIG_FILE.open(encoding="utf-8") as f:
+    CONFIG = json.load(f)
+log.info("Loaded config from %s", CONFIG_FILE)
+
+TIMEZONE = ZoneInfo(CONFIG.get("timezone", "UTC"))
 # Optional: a server ID makes slash commands show up instantly in that server.
 # Without it they sync globally, which can take up to an hour the first time.
-GUILD_ID = os.getenv("GUILD_ID")
-# You: can run /test without admin, and gets the daily summary DM.
-OWNER_ID = int(os.getenv("OWNER_ID", "1521185982475407421"))
-PLAN_FILE = Path(os.getenv("PLAN_FILE", Path(__file__).with_name("bible_in_a_year.json")))
+GUILD_ID = CONFIG.get("guild_id")
+# Can run /test without being an admin.
+OWNER_ID = int(CONFIG.get("owner_id", 1521185982475407421))
 
-# Daily summary DM. Leave OPENAI_API_KEY unset to turn it off.
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-SUMMARY_TIME = os.getenv("SUMMARY_TIME", "20:00")  # 24h HH:MM in TIMEZONE
-SUMMARY_IGNORE_CHANNELS = {int(c) for c in os.getenv("SUMMARY_IGNORE_CHANNELS", "").split(",") if c.strip()}
-SUMMARY_MAX_PER_CHANNEL = int(os.getenv("SUMMARY_MAX_PER_CHANNEL", "300"))
+READINGS = CONFIG["readings"]
+CHANNEL_ID = int(READINGS["channel_id"])
+START_DATE = dt.date.fromisoformat(READINGS["start_date"])  # the date of Day 1
+POST_TIME = READINGS.get("post_time", "06:00")  # 24h HH:MM in TIMEZONE
+# Relative paths are relative to bot.py.
+PLAN_FILE = Path(__file__).parent / READINGS.get("plan_file", "bible_in_a_year.json")
+
+SUMMARY = CONFIG.get("summary", {})
+SUMMARY_ENABLED = SUMMARY.get("enabled", True) and bool(OPENAI_API_KEY)
+SUMMARY_TIME = SUMMARY.get("time", "20:00")  # 24h HH:MM in TIMEZONE
+# Each gets their own nightly DM, written from their point of view.
+SUMMARY_RECIPIENTS = [int(i) for i in SUMMARY.get("recipients", [OWNER_ID])]
+OPENAI_MODEL = SUMMARY.get("model", "gpt-5-mini")
+SUMMARY_IGNORE_CHANNELS = {int(i) for i in SUMMARY.get("ignore_channels", [])}
+SUMMARY_MAX_PER_CHANNEL = int(SUMMARY.get("max_messages_per_channel", 300))
 
 
 def parse_time(value: str) -> dt.time:
@@ -48,7 +61,7 @@ def parse_time(value: str) -> dt.time:
 
 SEND_AT = parse_time(POST_TIME)
 SUMMARY_AT = parse_time(SUMMARY_TIME)
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if SUMMARY_ENABLED else None
 
 with PLAN_FILE.open(encoding="utf-8") as f:
     PLAN = json.load(f)
@@ -204,46 +217,50 @@ async def test_cmd(interaction: discord.Interaction, day: Optional[app_commands.
         await interaction.followup.send(f"✅ Sent day {day} to <#{CHANNEL_ID}>.", ephemeral=True)
 
 
-async def send_summary(hours: int = 24) -> str | None:
-    """Build the summary and DM it to the owner. Returns None on success, or why it failed."""
-    if openai_client is None:
-        return "OPENAI_API_KEY isn't set, so summaries are off."
+async def collect_messages(hours: int) -> list[summary.Msg]:
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
     guilds = [g for g in bot.guilds if not GUILD_ID or g.id == int(GUILD_ID)]
-    msgs = await summary.collect(guilds, since, OWNER_ID, SUMMARY_IGNORE_CHANNELS, SUMMARY_MAX_PER_CHANNEL)
+    return await summary.collect(guilds, since, SUMMARY_IGNORE_CHANNELS, SUMMARY_MAX_PER_CHANNEL)
 
+
+async def send_summary(user_id: int, msgs: list[summary.Msg]) -> str | None:
+    """Summarize msgs for one person and DM it to them. Returns None on success, or why it failed."""
+    if openai_client is None:
+        return "Summaries are off (no OPENAI_API_KEY, or summary.enabled is false)."
     try:
-        owner = await bot.fetch_user(OWNER_ID)
+        user = await bot.fetch_user(user_id)
     except discord.HTTPException as e:
-        return f"Couldn't look up owner {OWNER_ID}: {e.text}"
+        return f"Couldn't look up user {user_id}: {e.text}"
 
     if not msgs:
         chunks = [f"## 📋 Daily Summary\n-# {today():%a, %b} {today().day}\n\nQuiet day, no messages."]
     else:
         try:
-            result = await summary.summarize(openai_client, OPENAI_MODEL, msgs, TIMEZONE)
+            result = await summary.summarize(openai_client, OPENAI_MODEL, msgs, TIMEZONE, user_id)
         except Exception as e:  # network, auth, quota, bad model name...
             log.exception("OpenAI request failed")
             return f"OpenAI request failed: {e}"
-        chunks = summary.format_digest(result, msgs, today())
+        chunks = summary.format_digest(result, msgs, today(), user_id)
 
     try:
         for chunk in chunks:
-            await owner.send(chunk, suppress_embeds=True)
+            await user.send(chunk, suppress_embeds=True)
     except discord.Forbidden:
-        return "Discord won't let the bot DM you. Allow DMs from server members (Privacy Settings)."
+        return f"Discord won't let the bot DM {user}. They need to allow DMs from server members."
     except discord.HTTPException as e:
-        return f"Discord error {e.status} sending the DM: {e.text}"
+        return f"Discord error {e.status} sending the DM to {user}: {e.text}"
     log.info("Sent summary to %s: %d messages summarized, %d chars in %d DM part(s)",
-             owner, len(msgs), sum(len(c) for c in chunks), len(chunks))
+             user, len(msgs), sum(len(c) for c in chunks), len(chunks))
     return None
 
 
 @tasks.loop(time=SUMMARY_AT)
 async def daily_summary():
-    error = await send_summary()
-    if error:
-        log.error("Daily summary failed: %s", error)
+    msgs = await collect_messages(24)
+    for user_id in SUMMARY_RECIPIENTS:
+        error = await send_summary(user_id, msgs)
+        if error:
+            log.error("Daily summary for %s failed: %s", user_id, error)
 
 
 @daily_summary.error
@@ -254,12 +271,12 @@ async def daily_summary_error(error: BaseException):
 @bot.tree.command(name="summary", description="DM yourself the server summary right now")
 @app_commands.describe(hours="How far back to look (default 24)")
 async def summary_cmd(interaction: discord.Interaction, hours: Optional[app_commands.Range[int, 1, 168]] = 24):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Only the bot owner can use /summary.", ephemeral=True)
+    if interaction.user.id not in (OWNER_ID, *SUMMARY_RECIPIENTS):
+        await interaction.response.send_message("You're not on the summary list.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    log.info("/summary requested for the last %d hours", hours)
-    error = await send_summary(hours)
+    log.info("/summary by %s (%s) for the last %d hours", interaction.user, interaction.user.id, hours)
+    error = await send_summary(interaction.user.id, await collect_messages(hours))
     if error:
         log.error("/summary failed: %s", error)
         await interaction.followup.send(f"❌ {error}", ephemeral=True)
@@ -294,10 +311,11 @@ async def on_ready():
     log.info("Next daily post at %s", next_run(SEND_AT))
 
     if openai_client is None:
-        log.warning("OPENAI_API_KEY not set: daily summary is off")
+        log.warning("Daily summary is off (no OPENAI_API_KEY, or summary.enabled is false)")
     elif not daily_summary.is_running():
         daily_summary.start()
-        log.info("Next summary DM at %s (model %s)", next_run(SUMMARY_AT), OPENAI_MODEL)
+        log.info("Next summary DM at %s to %d recipient(s) (model %s)",
+                 next_run(SUMMARY_AT), len(SUMMARY_RECIPIENTS), OPENAI_MODEL)
 
 
 bot.run(TOKEN, log_handler=None)

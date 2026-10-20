@@ -1,0 +1,21 @@
+{
+  "guild_id": 123456789012345678,
+  "owner_id": 1521185982475407421,
+  "timezone": "America/New_York",
+
+  "readings": {
+    "channel_id": 123456789012345678,
+    "start_date": "2027-01-01",
+    "post_time": "06:00",
+    "plan_file": "bible_in_a_year.json"
+  },
+
+  "summary": {
+    "enabled": true,
+    "time": "20:00",
+    "recipients": [1521185982475407421],
+    "model": "gpt-5-mini",
+    "ignore_channels": [],
+    "max_messages_per_channel": 300
+  }
+}
