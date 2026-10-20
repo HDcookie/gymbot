@@ -234,7 +234,8 @@ async def send_summary(hours: int = 24) -> str | None:
         return "Discord won't let the bot DM you. Allow DMs from server members (Privacy Settings)."
     except discord.HTTPException as e:
         return f"Discord error {e.status} sending the DM: {e.text}"
-    log.info("Sent summary to %s: %d messages summarized, %d DM part(s)", owner, len(msgs), len(chunks))
+    log.info("Sent summary to %s: %d messages summarized, %d chars in %d DM part(s)",
+             owner, len(msgs), sum(len(c) for c in chunks), len(chunks))
     return None
 
 

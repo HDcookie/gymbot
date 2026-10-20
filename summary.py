@@ -133,6 +133,11 @@ respond: messages the owner should look at.
   the author's name is shown next to it, so don't start with it).
 - Skip messages written by the owner and anything the owner already replied to.
 
+Length: aim for the finished DM to be 2000 characters or less. Each item you return also gets about
+100 characters of links and formatting added, so keep your text tight. On a busy day, prefer fewer,
+more important items and shorter summaries. Going over is OK when there's a lot that matters, but
+it isn't ideal.
+
 Only use message ids and channel ids that appear in the input."""
 
 SCHEMA = {
