@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import logging
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 import discord
 from openai import AsyncOpenAI
@@ -109,24 +110,27 @@ def to_msg(m: discord.Message, guild_id: int, owner_id: int) -> Msg:
 SYSTEM_PROMPT = """\
 You write a daily digest of a Discord server for its owner. Messages from the owner are marked (YOU).
 
-Write about topics, never about people:
-- No names, usernames, nicknames or times anywhere in your output. Describe what was said, not who
-  said it: "Asked whether the plan restarts in January", "Meetup moved to 10 AM Saturday".
+Write about what happened, not a roll call of who was there:
+- Use a name when one person is the point: they asked something, shared news, made a decision, or
+  are waiting on the owner. In a conversation with several people, don't list who took part; just
+  say what was discussed and decided.
+- Mention a time only when it matters (a deadline, an event time, something late at night).
 - Plain, short, factual. No filler like "The conversation was about" or "Members discussed".
 
 conversations: the discussions worth knowing about.
-- Leave out small talk, greetings, jokes, one-off reactions, and anything that's only a few
-  messages, unless the owner needs to see it.
+- Small chats usually aren't worth including: small talk, greetings, jokes, one-off reactions, quick
+  exchanges of a few messages. Use judgment; a short exchange that matters (news, a decision,
+  something the owner would want to know) still belongs.
 - One entry per topic. For each: channel_id; title (2-6 words); summary (one sentence, two at most,
-  covering what was discussed and any outcome or decision); start_message_id and end_message_id
-  (the first and last message of that discussion).
+  covering what was discussed and any outcome or decision); start_message_id (its first message).
 
 respond: messages the owner should look at.
 - priority "reply": anything waiting on the owner: questions or requests to them, mentions, replies to
   their messages, and questions to the group nobody answered.
 - priority "opinion": questions or discussions that were already answered or settled, where the
   owner's view would still add something.
-- For each: message_id; title (2-6 words); reason (one short sentence saying what's needed, no names).
+- For each: message_id; title (2-6 words); reason (one short sentence saying what they asked or need;
+  the author's name is shown next to it, so don't start with it).
 - Skip messages written by the owner and anything the owner already replied to.
 
 Only use message ids and channel ids that appear in the input."""
@@ -141,13 +145,12 @@ SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["channel_id", "title", "summary", "start_message_id", "end_message_id"],
+                "required": ["channel_id", "title", "summary", "start_message_id"],
                 "properties": {
                     "channel_id": {"type": "string"},
                     "title": {"type": "string"},
                     "summary": {"type": "string"},
                     "start_message_id": {"type": "string"},
-                    "end_message_id": {"type": "string"},
                 },
             },
         },
@@ -169,7 +172,7 @@ SCHEMA = {
 }
 
 
-def build_transcript(msgs: list[Msg]) -> str:
+def build_transcript(msgs: list[Msg], tz: ZoneInfo) -> str:
     lines, current = [], None
     for m in msgs:
         if m.channel_id != current:
@@ -178,12 +181,12 @@ def build_transcript(msgs: list[Msg]) -> str:
         who = f"{m.author} (YOU)" if m.is_owner else m.author
         reply = f" (reply to {m.reply_to})" if m.reply_to else ""
         flags = f" [{', '.join(m.flags)}]" if m.flags else ""
-        lines.append(f"[{m.id}] {who}{reply}{flags}: {m.content}")
+        lines.append(f"[{m.id}] {m.time.astimezone(tz):%a %H:%M} {who}{reply}{flags}: {m.content}")
     return "\n".join(lines).strip()
 
 
-async def summarize(client: AsyncOpenAI, model: str, msgs: list[Msg]) -> dict:
-    transcript = build_transcript(msgs)
+async def summarize(client: AsyncOpenAI, model: str, msgs: list[Msg], tz: ZoneInfo) -> dict:
+    transcript = build_transcript(msgs, tz)
     log.info("Sending %d messages (%d chars) to %s", len(msgs), len(transcript), model)
     resp = await client.chat.completions.create(
         model=model,
@@ -198,16 +201,7 @@ async def summarize(client: AsyncOpenAI, model: str, msgs: list[Msg]) -> dict:
     return json.loads(resp.choices[0].message.content)
 
 
-def conversation_messages(c: dict, msgs: list[Msg], by_id: dict[str, Msg]) -> list[Msg]:
-    """The messages in a conversation's channel between its first and last message."""
-    start, end = by_id.get(c["start_message_id"]), by_id.get(c["end_message_id"])
-    if start is None:
-        return []
-    end = end or start
-    return [m for m in msgs if m.channel_id == start.channel_id and start.time <= m.time <= end.time]
-
-
-def format_digest(result: dict, msgs: list[Msg], date: dt.date, min_messages: int) -> list[str]:
+def format_digest(result: dict, msgs: list[Msg], date: dt.date) -> list[str]:
     """Turn the model's JSON into DM text, building every link from real ids."""
     by_id = {str(m.id): m for m in msgs}
     channels = {str(m.channel_id): m for m in msgs}  # any message, for guild id + channel name
@@ -219,18 +213,11 @@ def format_digest(result: dict, msgs: list[Msg], date: dt.date, min_messages: in
             log.warning("Dropping respond item with unknown message id %s", r["message_id"])
         elif not m.is_owner:
             respond.append((r, m))
-    respond_ids = {m.id for _, m in respond}
 
-    # Keep a conversation if it's long enough, or if something in it needs the owner.
     convos_by_channel: dict[str, list[dict]] = {}
-    skipped = 0
     for c in result["conversations"]:
         if c["channel_id"] not in channels:
             log.warning("Dropping conversation with unknown channel id %s", c["channel_id"])
-            continue
-        in_convo = conversation_messages(c, msgs, by_id)
-        if len(in_convo) < min_messages and not respond_ids & {m.id for m in in_convo}:
-            skipped += 1
             continue
         convos_by_channel.setdefault(c["channel_id"], []).append(c)
 
@@ -248,7 +235,7 @@ def format_digest(result: dict, msgs: list[Msg], date: dt.date, min_messages: in
             continue
         lines += ["", f"### {heading}"]
         for r, m in items:
-            lines.append(f"- **{r['title']}**: {r['reason']} · #{m.channel_name} · [Jump]({m.link})")
+            lines.append(f"- **{r['title']}** ({m.author}, #{m.channel_name}): {r['reason']} [Jump]({m.link})")
     if not replies and not opinions:
         lines += ["", "### ✅ Nothing needs you today"]
 
@@ -263,10 +250,7 @@ def format_digest(result: dict, msgs: list[Msg], date: dt.date, min_messages: in
             jump = f" [Jump]({start.link})" if start else ""
             lines.append(f"- **{c['title']}**: {c['summary']}{jump}")
 
-    footer = f"{len(msgs)} messages read"
-    if skipped:
-        footer += f" · {skipped} short conversation{'' if skipped == 1 else 's'} left out"
-    lines += ["", f"-# {footer}"]
+    lines += ["", f"-# {len(msgs)} messages read · small chats left out"]
     return split_message("\n".join(lines))
 
 
